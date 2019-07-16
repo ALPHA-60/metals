@@ -2,14 +2,13 @@ package scala.meta.internal.metals
 
 import java.util.concurrent.CompletableFuture
 import java.lang.ProcessBuilder
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.io.IOException
+import java.nio.ByteBuffer
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.Promise
+import scala.meta.internal.ansi.LineListener
 import scala.meta.internal.builds.Digest
 import scala.meta.internal.builds.Digest.Status
 import scala.meta.internal.builds.BuildTool
@@ -221,36 +220,35 @@ object BloopInstall {
   )(implicit ec: ExecutionContext): Process = {
     val runningProcess = pb.start()
 
-    def processLines(b: BufferedReader, process: String => Unit): Future[Unit] =
+    val stdoutLineListener = new LineListener(scribe.info(_))
+    val stderrLineListener = new LineListener(scribe.error(_))
+
+    def processLines(
+        in: java.io.InputStream,
+        listener: LineListener
+    ): Future[Unit] =
       Future {
-        var line: String = b.readLine()
-        while (line != null) {
-          process(line)
-          line = b.readLine()
+        val buffer = new Array[Byte](4096)
+        var length = in.read(buffer)
+        while (length != -1) {
+          listener.appendBytes(ByteBuffer.wrap(buffer, 0, length))
+          length = in.read(buffer)
         }
       }
 
-    val stdoutReader =
-      new BufferedReader(new InputStreamReader(runningProcess.getInputStream));
-    val stderrReader =
-      new BufferedReader(new InputStreamReader(runningProcess.getErrorStream));
-
     // start processing output
-    val stdoutLoggerProcess = processLines(stdoutReader, scribe.info(_))
+    val stdoutLoggerProcess =
+      processLines(runningProcess.getInputStream, stdoutLineListener)
     val stdErrLoggerProcess =
       if (!pb.redirectErrorStream)
-        processLines(stderrReader, scribe.error(_))
+        processLines(runningProcess.getErrorStream, stderrLineListener)
       else
         Future.successful(())
 
     // report status when streams end
     stdoutLoggerProcess.zip(stdErrLoggerProcess) onComplete { _ =>
-      try {
-        stdoutReader.close()
-        stderrReader.close()
-      } catch {
-        case _: IOException =>
-      }
+      stdoutLineListener.flushIfNonEmpty()
+      stderrLineListener.flushIfNonEmpty()
       val statusCode = runningProcess.waitFor()
       if (!completeProcess.isCompleted) {
         if (statusCode == 0) {
