@@ -220,8 +220,6 @@ lazy val metals = project
       // for persistent data like "dismissed notification"
       "org.flywaydb" % "flyway-core" % "5.2.1",
       "com.h2database" % "h2" % "1.4.197",
-      // for starting `sbt bloopInstall` process
-      "com.zaxxer" % "nuprocess" % "1.2.4",
       "net.java.dev.jna" % "jna" % "4.5.1",
       "net.java.dev.jna" % "jna-platform" % "4.5.1",
       // for token edit-distance used by goto definition

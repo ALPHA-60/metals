@@ -1,16 +1,15 @@
 package scala.meta.internal.metals
 
-import java.nio.ByteBuffer
 import java.util.concurrent.CompletableFuture
+import java.lang.ProcessBuilder
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.io.IOException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
-import com.zaxxer.nuprocess.NuAbstractProcessHandler
-import com.zaxxer.nuprocess.NuProcess
-import com.zaxxer.nuprocess.NuProcessBuilder
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.Promise
-import scala.meta.internal.ansi.LineListener
 import scala.meta.internal.builds.Digest
 import scala.meta.internal.builds.Digest.Status
 import scala.meta.internal.builds.BuildTool
@@ -68,16 +67,13 @@ final class BloopInstall(
   ): Future[BloopInstallResult] = {
     persistChecksumStatus(Status.Started, buildTool)
     val elapsed = new Timer(time)
-    val handler = new BloopInstall.ProcessHandler(
-      joinErrorWithInfo = buildTool.redirectErrorOutput
-    )
-    val pb = new NuProcessBuilder(handler, args.asJava)
-    pb.setCwd(workspace.toNIO)
+    val pb = new ProcessBuilder(args: _*)
+    pb.directory(workspace.toNIO.toFile)
+    pb.redirectErrorStream(buildTool.redirectErrorOutput)
     userConfig().javaHome.foreach(pb.environment().put("JAVA_HOME", _))
     pb.environment().put("COURSIER_PROGRESS", "disable")
     pb.environment().put("METALS_ENABLED", "true")
     pb.environment().put("SCALAMETA_VERSION", BuildInfo.semanticdbVersion)
-    val runningProcess = pb.start()
     // NOTE(olafur): older versions of VS Code don't respect cancellation of
     // window/showMessageRequest, meaning the "cancel build import" button
     // stays forever in view even after successful build import. In newer
@@ -86,8 +82,11 @@ final class BloopInstall(
       languageClient.metalsSlowTask(
         Messages.bloopInstallProgress(buildTool.executableName)
       )
-    handler.response = Some(taskResponse)
-    val processFuture = handler.completeProcess.future.map { result =>
+    val completeProcess = Promise[BloopInstallResult]()
+    val runningProcess =
+      BloopInstall.runSubprocess(pb, completeProcess, taskResponse)
+
+    val processFuture = completeProcess.future.map { result =>
       taskResponse.cancel(false)
       scribe.info(
         s"time: ran '${buildTool.executableName} bloopInstall' in $elapsed"
@@ -101,7 +100,7 @@ final class BloopInstall(
     taskResponse.asScala.foreach { item =>
       if (item.cancel) {
         scribe.info("user cancelled build import")
-        handler.completeProcess.complete(
+        completeProcess.complete(
           Success(BloopInstallResult.Cancelled)
         )
         BloopInstall.destroyProcess(runningProcess)
@@ -205,36 +204,54 @@ object BloopInstall {
   /**
    * First tries to destroy the process gracefully, with fallback to forcefully.
    */
-  private def destroyProcess(process: NuProcess): Unit = {
-    process.destroy(false)
-    val exit = process.waitFor(2, TimeUnit.SECONDS)
-    if (exit == Integer.MIN_VALUE) {
+  private def destroyProcess(process: Process): Unit = {
+    process.destroy()
+    val destroyed = process.waitFor(2, TimeUnit.SECONDS)
+    if (!destroyed) {
       // timeout exceeded, kill process forcefully.
-      process.destroy(true)
+      process.destroyForcibly()
       process.waitFor(2, TimeUnit.SECONDS)
     }
   }
 
-  /**
-   * Converts running system processing into Future[BloopInstallResult].
-   */
-  private class ProcessHandler(
-      joinErrorWithInfo: Boolean
-  ) extends NuAbstractProcessHandler {
-    var response: Option[CompletableFuture[_]] = None
-    val completeProcess = Promise[BloopInstallResult]()
-    val stdout = new LineListener(line => scribe.info(line))
-    val stderr =
-      if (joinErrorWithInfo) stdout
-      else new LineListener(line => scribe.error(line))
+  def runSubprocess(
+      pb: ProcessBuilder,
+      completeProcess: Promise[BloopInstallResult],
+      taskResponse: CompletableFuture[MetalsSlowTaskResult]
+  )(implicit ec: ExecutionContext): Process = {
+    val runningProcess = pb.start()
 
-    override def onStart(nuProcess: NuProcess): Unit = {
-      nuProcess.closeStdin(false)
-    }
+    def processLines(b: BufferedReader, process: String => Unit): Future[Unit] =
+      Future {
+        var line: String = b.readLine()
+        while (line != null) {
+          process(line)
+          line = b.readLine()
+        }
+      }
 
-    override def onExit(statusCode: Int): Unit = {
-      stdout.flushIfNonEmpty()
-      stderr.flushIfNonEmpty()
+    val stdoutReader =
+      new BufferedReader(new InputStreamReader(runningProcess.getInputStream));
+    val stderrReader =
+      new BufferedReader(new InputStreamReader(runningProcess.getErrorStream));
+
+    // start processing output
+    val stdoutLoggerProcess = processLines(stdoutReader, scribe.info(_))
+    val stdErrLoggerProcess =
+      if (!pb.redirectErrorStream)
+        processLines(stderrReader, scribe.error(_))
+      else
+        Future.successful(())
+
+    // report status when streams end
+    stdoutLoggerProcess.zip(stdErrLoggerProcess) onComplete { _ =>
+      try {
+        stdoutReader.close()
+        stderrReader.close()
+      } catch {
+        case _: IOException =>
+      }
+      val statusCode = runningProcess.waitFor()
       if (!completeProcess.isCompleted) {
         if (statusCode == 0) {
           completeProcess.trySuccess(BloopInstallResult.Installed)
@@ -243,19 +260,9 @@ object BloopInstall {
         }
       }
       scribe.info(s"build tool exit: $statusCode")
-      response.foreach(_.cancel(false))
+      taskResponse.cancel(false)
     }
 
-    override def onStdout(buffer: ByteBuffer, closed: Boolean): Unit = {
-      if (!closed) {
-        stdout.appendBytes(buffer)
-      }
-    }
-
-    override def onStderr(buffer: ByteBuffer, closed: Boolean): Unit = {
-      if (!closed) {
-        stderr.appendBytes(buffer)
-      }
-    }
+    runningProcess
   }
 }
